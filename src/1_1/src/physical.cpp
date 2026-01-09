@@ -203,47 +203,57 @@ static int capture_frame()
 
 // Determine bit shift from sync pattern
 // Return -1 if not a valid sync pattern
-static int get_shift_from_sync(uint8_t sync1, uint8_t sync2)
+// Also checks inverted pattern and returns shift via pointer
+// Returns: 0 = normal, 1 = inverted, -1 = invalid
+// Fully unrolled for maximum speed - no loops, no table lookups
+static inline __attribute__((always_inline)) int get_shift_from_sync_ex(uint8_t sync1, uint8_t sync2, int &shift)
 {
+    // Pre-compute masks for both normal and inverted
     uint8_t a1 = sync1 & 0xAA;
     uint8_t b1 = sync1 & 0x55;
     uint8_t a2 = sync2 & 0xAA;
     uint8_t b2 = sync2 & 0x55;
 
-    if (a1 == 0x8A && a2 == 0x08) return 0;
-    if (b1 == 0x45 && b2 == 0x04) return 1;
-    if (a1 == 0x22 && a2 == 0x82) return 2;
-    if (b1 == 0x11 && b2 == 0x41) return 3;
-    if (a1 == 0x08 && a2 == 0xA0) return 4;
-    if (b1 == 0x04 && b2 == 0x50) return 5;
-    if (a1 == 0x02 && a2 == 0x28) return 6;
-    if (b1 == 0x01 && b2 == 0x14) return 7;
+    // Check normal patterns (ordered by likely frequency - shift 0 first)
+    if (a1 == 0x8A && a2 == 0x08) { shift = 0; return 0; }
+    if (b1 == 0x45 && b2 == 0x04) { shift = 1; return 0; }
+    if (a1 == 0x22 && a2 == 0x82) { shift = 2; return 0; }
+    if (b1 == 0x11 && b2 == 0x41) { shift = 3; return 0; }
+    if (a1 == 0x08 && a2 == 0xA0) { shift = 4; return 0; }
+    if (b1 == 0x04 && b2 == 0x50) { shift = 5; return 0; }
+    if (a1 == 0x02 && a2 == 0x28) { shift = 6; return 0; }
+    if (b1 == 0x01 && b2 == 0x14) { shift = 7; return 0; }
 
-    return -1;
+    // Check inverted patterns
+    uint8_t inv_a1 = (~sync1) & 0xAA;
+    uint8_t inv_b1 = (~sync1) & 0x55;
+    uint8_t inv_a2 = (~sync2) & 0xAA;
+    uint8_t inv_b2 = (~sync2) & 0x55;
+
+    if (inv_a1 == 0x8A && inv_a2 == 0x08) { shift = 0; return 1; }
+    if (inv_b1 == 0x45 && inv_b2 == 0x04) { shift = 1; return 1; }
+    if (inv_a1 == 0x22 && inv_a2 == 0x82) { shift = 2; return 1; }
+    if (inv_b1 == 0x11 && inv_b2 == 0x41) { shift = 3; return 1; }
+    if (inv_a1 == 0x08 && inv_a2 == 0xA0) { shift = 4; return 1; }
+    if (inv_b1 == 0x04 && inv_b2 == 0x50) { shift = 5; return 1; }
+    if (inv_a1 == 0x02 && inv_a2 == 0x28) { shift = 6; return 1; }
+    if (inv_b1 == 0x01 && inv_b2 == 0x14) { shift = 7; return 1; }
+
+    shift = -1;
+    return -1; // invalid
 }
 
 // Find sync pattern in received data
 // Return index of first sync byte
-static int find_sync_index(int rx_len, int &shift, bool &invert)
+// Optimized: single function call checks both normal and inverted patterns
+static inline __attribute__((always_inline)) int find_sync_index(int rx_len, int &shift, bool &invert)
 {
     for (int i = 0; i < rx_len - 1; i++)
     {
-        uint8_t b1 = rx_buf[i];
-        uint8_t b2 = rx_buf[i + 1];
-
-        int shift1 = get_shift_from_sync(b1, b2);
-        int shift2 = get_shift_from_sync(~b1, ~b2);
-
-        if (shift1 != -1 && shift1 > shift2)
+        int result = get_shift_from_sync_ex(rx_buf[i], rx_buf[i + 1], shift);
+        if (result >= 0)
         {
-            shift = shift1;
-            invert = false;
-            return i;
-        }
-        if (shift2 != -1 && shift2 > shift1)
-        {
-            shift = shift2;
-            invert = true;
+            invert = (result == 1);
             return i;
         }
     }
@@ -252,91 +262,63 @@ static int find_sync_index(int rx_len, int &shift, bool &invert)
 
 // Extract one byte from 3 bytes of received data
 // according to the specified bit shift
-// Fully unrolled for maximum speed (no loops)
-static uint8_t extract_byte(int shift, uint8_t d0, uint8_t d1, uint8_t d2)
+// Optimized using bitwise operations - fully inlined for speed
+static inline __attribute__((always_inline)) uint8_t extract_byte(int shift, uint8_t d0, uint8_t d1, uint8_t d2)
 {
     uint8_t r = 0;
+
+    // Use switch for compile-time optimization, but with simplified bit extraction
+    // The compiler will generate efficient code for this pattern
     switch (shift)
     {
     case 0:
-        if (d0 & 0x80) r |= 0x80;
-        if (d0 & 0x20) r |= 0x40;
-        if (d0 & 0x08) r |= 0x20;
-        if (d0 & 0x02) r |= 0x10;
-        if (d1 & 0x80) r |= 0x08;
-        if (d1 & 0x20) r |= 0x04;
-        if (d1 & 0x08) r |= 0x02;
-        if (d1 & 0x02) r |= 0x01;
+        // d0[7,5,3,1] -> r[7,6,5,4], d1[7,5,3,1] -> r[3,2,1,0]
+        r = ((d0 & 0x80) ? 0x80 : 0) | ((d0 & 0x20) ? 0x40 : 0) |
+            ((d0 & 0x08) ? 0x20 : 0) | ((d0 & 0x02) ? 0x10 : 0) |
+            ((d1 & 0x80) ? 0x08 : 0) | ((d1 & 0x20) ? 0x04 : 0) |
+            ((d1 & 0x08) ? 0x02 : 0) | ((d1 & 0x02) ? 0x01 : 0);
         break;
     case 1:
-        if (d0 & 0x40) r |= 0x80;
-        if (d0 & 0x10) r |= 0x40;
-        if (d0 & 0x04) r |= 0x20;
-        if (d0 & 0x01) r |= 0x10;
-        if (d1 & 0x40) r |= 0x08;
-        if (d1 & 0x10) r |= 0x04;
-        if (d1 & 0x04) r |= 0x02;
-        if (d1 & 0x01) r |= 0x01;
+        r = ((d0 & 0x40) ? 0x80 : 0) | ((d0 & 0x10) ? 0x40 : 0) |
+            ((d0 & 0x04) ? 0x20 : 0) | ((d0 & 0x01) ? 0x10 : 0) |
+            ((d1 & 0x40) ? 0x08 : 0) | ((d1 & 0x10) ? 0x04 : 0) |
+            ((d1 & 0x04) ? 0x02 : 0) | ((d1 & 0x01) ? 0x01 : 0);
         break;
     case 2:
-        if (d0 & 0x20) r |= 0x80;
-        if (d0 & 0x08) r |= 0x40;
-        if (d0 & 0x02) r |= 0x20;
-        if (d1 & 0x80) r |= 0x10;
-        if (d1 & 0x20) r |= 0x08;
-        if (d1 & 0x08) r |= 0x04;
-        if (d1 & 0x02) r |= 0x02;
-        if (d2 & 0x80) r |= 0x01;
+        r = ((d0 & 0x20) ? 0x80 : 0) | ((d0 & 0x08) ? 0x40 : 0) |
+            ((d0 & 0x02) ? 0x20 : 0) | ((d1 & 0x80) ? 0x10 : 0) |
+            ((d1 & 0x20) ? 0x08 : 0) | ((d1 & 0x08) ? 0x04 : 0) |
+            ((d1 & 0x02) ? 0x02 : 0) | ((d2 & 0x80) ? 0x01 : 0);
         break;
     case 3:
-        if (d0 & 0x10) r |= 0x80;
-        if (d0 & 0x04) r |= 0x40;
-        if (d0 & 0x01) r |= 0x20;
-        if (d1 & 0x40) r |= 0x10;
-        if (d1 & 0x10) r |= 0x08;
-        if (d1 & 0x04) r |= 0x04;
-        if (d1 & 0x01) r |= 0x02;
-        if (d2 & 0x40) r |= 0x01;
+        r = ((d0 & 0x10) ? 0x80 : 0) | ((d0 & 0x04) ? 0x40 : 0) |
+            ((d0 & 0x01) ? 0x20 : 0) | ((d1 & 0x40) ? 0x10 : 0) |
+            ((d1 & 0x10) ? 0x08 : 0) | ((d1 & 0x04) ? 0x04 : 0) |
+            ((d1 & 0x01) ? 0x02 : 0) | ((d2 & 0x40) ? 0x01 : 0);
         break;
     case 4:
-        if (d0 & 0x08) r |= 0x80;
-        if (d0 & 0x02) r |= 0x40;
-        if (d1 & 0x80) r |= 0x20;
-        if (d1 & 0x20) r |= 0x10;
-        if (d1 & 0x08) r |= 0x08;
-        if (d1 & 0x02) r |= 0x04;
-        if (d2 & 0x80) r |= 0x02;
-        if (d2 & 0x20) r |= 0x01;
+        r = ((d0 & 0x08) ? 0x80 : 0) | ((d0 & 0x02) ? 0x40 : 0) |
+            ((d1 & 0x80) ? 0x20 : 0) | ((d1 & 0x20) ? 0x10 : 0) |
+            ((d1 & 0x08) ? 0x08 : 0) | ((d1 & 0x02) ? 0x04 : 0) |
+            ((d2 & 0x80) ? 0x02 : 0) | ((d2 & 0x20) ? 0x01 : 0);
         break;
     case 5:
-        if (d0 & 0x04) r |= 0x80;
-        if (d0 & 0x01) r |= 0x40;
-        if (d1 & 0x40) r |= 0x20;
-        if (d1 & 0x10) r |= 0x10;
-        if (d1 & 0x04) r |= 0x08;
-        if (d1 & 0x01) r |= 0x04;
-        if (d2 & 0x40) r |= 0x02;
-        if (d2 & 0x10) r |= 0x01;
+        r = ((d0 & 0x04) ? 0x80 : 0) | ((d0 & 0x01) ? 0x40 : 0) |
+            ((d1 & 0x40) ? 0x20 : 0) | ((d1 & 0x10) ? 0x10 : 0) |
+            ((d1 & 0x04) ? 0x08 : 0) | ((d1 & 0x01) ? 0x04 : 0) |
+            ((d2 & 0x40) ? 0x02 : 0) | ((d2 & 0x10) ? 0x01 : 0);
         break;
     case 6:
-        if (d0 & 0x02) r |= 0x80;
-        if (d1 & 0x80) r |= 0x40;
-        if (d1 & 0x20) r |= 0x20;
-        if (d1 & 0x08) r |= 0x10;
-        if (d1 & 0x02) r |= 0x08;
-        if (d2 & 0x80) r |= 0x04;
-        if (d2 & 0x20) r |= 0x02;
-        if (d2 & 0x08) r |= 0x01;
+        r = ((d0 & 0x02) ? 0x80 : 0) | ((d1 & 0x80) ? 0x40 : 0) |
+            ((d1 & 0x20) ? 0x20 : 0) | ((d1 & 0x08) ? 0x10 : 0) |
+            ((d1 & 0x02) ? 0x08 : 0) | ((d2 & 0x80) ? 0x04 : 0) |
+            ((d2 & 0x20) ? 0x02 : 0) | ((d2 & 0x08) ? 0x01 : 0);
         break;
     case 7:
-        if (d0 & 0x01) r |= 0x80;
-        if (d1 & 0x40) r |= 0x40;
-        if (d1 & 0x10) r |= 0x20;
-        if (d1 & 0x04) r |= 0x10;
-        if (d1 & 0x01) r |= 0x08;
-        if (d2 & 0x40) r |= 0x04;
-        if (d2 & 0x10) r |= 0x02;
-        if (d2 & 0x04) r |= 0x01;
+        r = ((d0 & 0x01) ? 0x80 : 0) | ((d1 & 0x40) ? 0x40 : 0) |
+            ((d1 & 0x10) ? 0x20 : 0) | ((d1 & 0x04) ? 0x10 : 0) |
+            ((d1 & 0x01) ? 0x08 : 0) | ((d2 & 0x40) ? 0x04 : 0) |
+            ((d2 & 0x10) ? 0x02 : 0) | ((d2 & 0x04) ? 0x01 : 0);
         break;
     }
     return r;
@@ -615,3 +597,4 @@ void loop()
         send_response(resp);
     }
 }
+
