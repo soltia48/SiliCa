@@ -7,6 +7,7 @@
 #include <string.h>
 #include <avr/eeprom.h>
 #include "application.h"
+#include "physical.h"
 
 // ============================================================================
 // EEPROM Data Storage
@@ -33,12 +34,32 @@ static uint8_t response[RESPONSE_BUF_SIZE];
 // Initialization
 // ============================================================================
 
+// Check if all bytes in array are 0xFF
+static bool is_all_ff(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+    {
+        if (data[i] != 0xFF)
+            return false;
+    }
+    return true;
+}
+
 void initialize()
 {
     eeprom_read_block(idm, idm_eep, 8);
     eeprom_read_block(pmm, pmm_eep, 8);
     eeprom_read_block(service_code, service_code_eep, 2 * SERVICE_MAX);
     eeprom_read_block(system_code, system_code_eep, 2 * SYSTEM_MAX);
+
+    // If IDm in EEPROM is all 0xFF (uninitialized), generate random IDm
+    if (is_all_ff(idm, 8))
+    {
+        generate_random_bytes(idm, 8);
+        // IDm byte 0: upper nibble is system index (0), lower nibble is manufacturer code
+        // Clear upper nibble to ensure system index 0
+        idm[0] = (idm[0] & 0x0F);
+    }
 }
 
 // ============================================================================
