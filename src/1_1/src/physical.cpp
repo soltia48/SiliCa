@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <avr/io.h>
+#include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 #include <util/crc16.h>
 #include <util/delay.h>
@@ -49,6 +50,57 @@ static uint8_t rx_buf[RX_BUF_SIZE];
 
 // Buffer for command processing
 static uint8_t command[CMD_BUF_SIZE];
+
+// ============================================================================
+// Delayed Response for Polling Command
+// ============================================================================
+
+// Pending response to be sent after timer expires
+static volatile packet_t pending_response = nullptr;
+
+// Flag indicating timer has expired
+static volatile bool timer_expired = false;
+
+// Start delay timer using TCB0
+// Timer starts counting from capture_frame completion
+static void start_delay_timer()
+{
+    // Reset state
+    pending_response = nullptr;
+    timer_expired = false;
+
+    // Reset counter and start timer
+    TCB0.CNT = 0;
+    TCB0.CTRLA = TCB_CLKSEL_CLKDIV1_gc | TCB_ENABLE_bm;
+}
+
+// Stop delay timer
+static void stop_delay_timer()
+{
+    TCB0.CTRLA = 0;
+}
+
+// TCB0 interrupt handler for delayed response
+ISR(TCB0_INT_vect)
+{
+    // Disable timer and clear interrupt flag
+    TCB0.CTRLA = 0;
+    TCB0.INTFLAGS = TCB_CAPT_bm;
+
+    // If response is already available, send it
+    // Otherwise, set flag to indicate timer has expired
+    packet_t resp = pending_response;
+    if (resp != nullptr)
+    {
+        pending_response = nullptr;
+        timer_expired = false;
+        send_response(resp);
+    }
+    else
+    {
+        timer_expired = true;
+    }
+}
 
 // ============================================================================
 // Serial Output Functions
@@ -292,10 +344,17 @@ static uint8_t extract_byte(int shift, uint8_t d0, uint8_t d1, uint8_t d2)
 
 // Receive command packet from the reader
 // Return null if error
+// Starts delay timer immediately after capture_frame completes
 packet_t receive_command()
 {
     // Capture frame
     int rx_len = capture_frame();
+
+    // Start delay timer immediately after capture_frame completes
+    // Timer starts counting from this point for Polling command
+    // Will be stopped later if not a Polling command or if error occurs
+    start_delay_timer();
+
     if (rx_len == 0)
     {
         return nullptr;
@@ -472,6 +531,16 @@ void setup()
     USART0.BAUD = 118; // 115200bps
     USART0.CTRLB = USART_TXEN_bm;
 
+    // Set up TCB0 for delayed response (Polling command)
+    // Timer will be started in receive_command after capture_frame
+    // 2.417ms - preamble+sync(64bit)@212kbps(302us) = 2.115ms delay at 3.39MHz = 7170 cycles
+    TCB0.CCMP = 7170;
+    TCB0.CTRLB = TCB_CNTMODE_INT_gc; // Periodic interrupt mode
+    TCB0.INTCTRL = TCB_CAPT_bm;      // Enable capture interrupt
+
+    // Enable global interrupts
+    sei();
+
     // Application layer initialization
     initialize();
 
@@ -485,25 +554,64 @@ void setup()
 // Main Loop
 // ============================================================================
 
+// Set response and send when timer expires (or immediately if already expired)
+static void send_delayed_response(packet_t response)
+{
+    // Disable interrupts to safely check and update state
+    cli();
+
+    if (timer_expired)
+    {
+        // Timer already expired, send immediately
+        timer_expired = false;
+        sei();
+        send_response(response);
+    }
+    else
+    {
+        // Timer not yet expired, ISR will send the response
+        pending_response = response;
+        sei();
+    }
+}
+
 // Main loop
 // Process commands continuously
+// Note: Timer is started in receive_command() right after capture_frame()
 void loop()
 {
+    // Timer is started in receive_command after capture_frame completes
     packet_t cmd = receive_command();
     if (cmd == nullptr)
         return;
+
+    // Check if this is a Polling command
+    // Timer was already started in receive_command, so we need to either:
+    // - Keep it running for Polling command (cmd[1] == 0x00)
+    // - Stop it for other commands
+    bool is_polling = (cmd[1] == 0x00);
+    if (!is_polling)
+    {
+        // Stop timer for non-Polling commands
+        stop_delay_timer();
+    }
 
     packet_t resp = process(cmd);
     if (resp == nullptr)
     {
         save_error(cmd);
+        // Stop timer if still running
+        stop_delay_timer();
         return;
     }
 
-    // Delay for Polling command
-    // 1000us + 1500us = 2.5ms
-    if (cmd[1] == 0x00)
-        _delay_us(1500);
-
-    send_response(resp);
+    if (is_polling)
+    {
+        // Use timer for delayed response (2.417ms from capture_frame completion)
+        send_delayed_response(resp);
+    }
+    else
+    {
+        send_response(resp);
+    }
 }
