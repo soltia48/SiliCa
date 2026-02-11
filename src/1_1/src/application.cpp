@@ -8,6 +8,7 @@
 #include <string.h>
 #include <avr/eeprom.h>
 #include "application.h"
+#include "physical.h"
 
 // ============================================================================
 // Compiler Optimization Hints
@@ -42,12 +43,30 @@ static uint8_t response[RESPONSE_BUF_SIZE];
 // Initialization
 // ============================================================================
 
+// "RANDOMID" in ASCII: 0x52, 0x41, 0x4E, 0x44, 0x4F, 0x4D, 0x49, 0x44
+static const uint8_t RANDOM_ID_MARKER[8] = {'R', 'A', 'N', 'D', 'O', 'M', 'I', 'D'};
+
+// Check if IDm is "RANDOMID" marker
+static bool is_random_id_marker(const uint8_t *data)
+{
+    return memcmp(data, RANDOM_ID_MARKER, 8) == 0;
+}
+
 void initialize()
 {
     eeprom_read_block(idm, idm_eep, 8);
     eeprom_read_block(pmm, pmm_eep, 8);
     eeprom_read_block(service_code, service_code_eep, 2 * SERVICE_MAX);
     eeprom_read_block(system_code, system_code_eep, 2 * SYSTEM_MAX);
+
+    // If IDm in EEPROM is "RANDOMID", generate random IDm
+    if (is_random_id_marker(idm))
+    {
+        generate_random_bytes(idm, 8);
+        // IDm byte 0: upper nibble is system index (0), lower nibble is manufacturer code
+        // Clear upper nibble to ensure system index 0
+        idm[0] = (idm[0] & 0x0F);
+    }
 }
 
 // ============================================================================
