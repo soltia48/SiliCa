@@ -30,7 +30,6 @@ enum FelicaCommand : uint8_t {
 };
 
 // Status flags returned to the reader.
-// Names follow the felica-rs StatusFlag1/StatusFlag2 definitions.
 
 // Status Flag 1.
 static constexpr uint8_t SF1_NORMAL_COMPLETION = 0x00;

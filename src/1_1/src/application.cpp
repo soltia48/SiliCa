@@ -1,11 +1,9 @@
 // Application layer implementation for SiliCa
 // JIS X 6319-4 compatible card implementation
-// Optimized for speed
 //
 // Debug output is controlled by the DEBUG macro; see silica.h.
 
 #include "application.h"
-#include "compiler.h"
 #include "entropy.h"
 #include "physical.h"
 #include <avr/eeprom.h>
@@ -61,24 +59,23 @@ void initialize() {
 }
 
 // ============================================================================
-// Optimized Helper Functions
+// Helper Functions
 // ============================================================================
 
-// Set error response with status flags - inlined for speed
-static FORCE_INLINE void set_error_response(uint8_t status1, uint8_t status2) {
+// Set error response with status flags
+static void set_error_response(uint8_t status1, uint8_t status2) {
   response[RESP_LEN] = STATUS_RESPONSE_LEN;
   response[RESP_PAYLOAD] = status1;
   response[RESP_PAYLOAD + 1] = status2;
 }
 
 // Fast 16-bit little-endian read from byte array
-static FORCE_INLINE uint16_t read_le16(const uint8_t *ptr) {
+static uint16_t read_le16(const uint8_t *ptr) {
   return ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 }
 
 // Parse block list and extract block numbers
 // Returns size of block list on success, 0 on error
-// Optimized with hints and early exit
 static int parse_block_list(int n, const uint8_t *block_list,
                             uint8_t *block_nums) {
   int j = 0;
@@ -90,7 +87,7 @@ static int parse_block_list(int n, const uint8_t *block_list,
       j += 2;
     } else if (header == 0x00) {
       // 3-byte block list element
-      if (UNLIKELY(block_list[j + 2] != 0x00))
+      if (block_list[j + 2] != 0x00)
         return 0;
       block_nums[i] = block_list[j + 1];
       j += 3;
@@ -146,11 +143,11 @@ static bool polling(packet_t command) {
   if (cmd2 == 0xFF && cmd3 == 0xFF)
     system_index = 0;
 
-  if (UNLIKELY(system_index == -1))
+  if (system_index == -1)
     return false;
 
   const uint8_t request_code = command[4];
-  if (UNLIKELY(request_code > 0x02))
+  if (request_code > 0x02)
     return false;
 
   // Response = LEN + CODE + IDm(8) + PMm(8), plus 2 bytes when requested.
@@ -182,17 +179,17 @@ static bool polling(packet_t command) {
 }
 
 static bool request_service(packet_t command) {
-  if (UNLIKELY(command[0] < 11))
+  if (command[0] < 11)
     return false;
 
   const int n = command[10]; // Number of nodes
-  if (UNLIKELY(!(1 <= n && n <= 32)))
+  if (!(1 <= n && n <= 32))
     return false;
 
   response[RESP_LEN] = RESP_PAYLOAD + 1 + 2 * n;
   response[RESP_PAYLOAD] = n;
 
-  // Return key version 0 for all nodes - optimized with memset
+  // Return key version 0 for all nodes
   memset(response + RESP_PAYLOAD + 1, 0x00, 2 * n);
 
   return true;
@@ -247,11 +244,11 @@ static bool write_special_block(int block_num, const uint8_t *src) {
 }
 
 static bool read_without_encryption(packet_t command) {
-  if (UNLIKELY(command[0] < 16))
+  if (command[0] < 16)
     return false;
 
   const int m = command[10]; // Number of services
-  if (UNLIKELY(m != 1)) {
+  if (m != 1) {
     set_error_response(SF1_ERROR, SF2_SERVICE_OR_NODE_COUNT_OUT_OF_RANGE);
     return true;
   }
@@ -259,18 +256,18 @@ static bool read_without_encryption(packet_t command) {
   const uint16_t target_service_code = read_le16(command + 11);
   const int n = command[13]; // Number of blocks
 
-  if (UNLIKELY(!find_service_code(target_service_code))) {
+  if (!find_service_code(target_service_code)) {
     set_error_response(SF1_ERROR, SF2_REFERENCED_NODE_DOES_NOT_EXIST);
     return true;
   }
 
-  if (UNLIKELY(!(1 <= n && n <= BLOCK_MAX))) {
+  if (!(1 <= n && n <= BLOCK_MAX)) {
     set_error_response(SF1_ERROR, SF2_BLOCK_COUNT_OUT_OF_RANGE);
     return true;
   }
 
   uint8_t block_nums[BLOCK_MAX];
-  if (UNLIKELY(parse_block_list(n, command + 14, block_nums) == 0)) {
+  if (parse_block_list(n, command + 14, block_nums) == 0) {
     set_error_response(SF1_ERROR, SF2_REFERENCED_NODE_DOES_NOT_EXIST);
     return true;
   }
@@ -284,7 +281,7 @@ static bool read_without_encryption(packet_t command) {
     uint8_t *const dest = response + RESP_PAYLOAD + 3 + 16 * i;
 
     // Normal data blocks (most common case first)
-    if (LIKELY(block_num < BLOCK_MAX)) {
+    if (block_num < BLOCK_MAX) {
       eeprom_read_block(dest, block_data_eep + 16 * block_num, 16);
       continue;
     }
@@ -318,15 +315,15 @@ static bool write_without_encryption(packet_t command) {
   const int m = command[10]; // Number of services
   const int n = command[13]; // Number of blocks
 
-  if (UNLIKELY(len < 32))
+  if (len < 32)
     return false;
 
-  if (UNLIKELY(m != 1)) {
+  if (m != 1) {
     set_error_response(SF1_ERROR, SF2_SERVICE_OR_NODE_COUNT_OUT_OF_RANGE);
     return true;
   }
 
-  if (UNLIKELY(!(1 <= n && n <= BLOCK_MAX))) {
+  if (!(1 <= n && n <= BLOCK_MAX)) {
     set_error_response(SF1_ERROR, SF2_BLOCK_COUNT_OUT_OF_RANGE);
     return true;
   }
@@ -334,12 +331,12 @@ static bool write_without_encryption(packet_t command) {
   uint8_t block_nums[BLOCK_MAX];
   const int block_list_len = parse_block_list(n, command + 14, block_nums);
 
-  if (UNLIKELY(block_list_len == 0)) {
+  if (block_list_len == 0) {
     set_error_response(SF1_ERROR, SF2_REFERENCED_NODE_DOES_NOT_EXIST);
     return true;
   }
 
-  if (UNLIKELY(len != 14 + block_list_len + 16 * n))
+  if (len != 14 + block_list_len + 16 * n)
     return false;
 
   // Pre-check for single block special cases
@@ -352,7 +349,7 @@ static bool write_without_encryption(packet_t command) {
     const uint8_t *const src = data_start + 16 * i;
 
     // Normal data blocks (most common case first)
-    if (LIKELY(block_num < BLOCK_MAX)) {
+    if (block_num < BLOCK_MAX) {
       eeprom_update_block(src, block_data_eep + 16 * block_num, 16);
       continue;
     }
@@ -373,10 +370,10 @@ static bool write_without_encryption(packet_t command) {
   return true;
 }
 
-static FORCE_INLINE bool search_service_code(int index) {
+static bool search_service_code(int index) {
   response[RESP_LEN] = STATUS_RESPONSE_LEN;
 
-  if (UNLIKELY(index < 0 || index >= SERVICE_MAX)) {
+  if (index < 0 || index >= SERVICE_MAX) {
     response[RESP_PAYLOAD] = 0xFF;
     response[RESP_PAYLOAD + 1] = 0xFF;
     return true;
@@ -432,7 +429,7 @@ void save_error(packet_t command) {
 // ============================================================================
 
 packet_t process(packet_t command) {
-  if (UNLIKELY(command == nullptr))
+  if (command == nullptr)
     return nullptr;
 
   const int len = command[0];
@@ -449,13 +446,13 @@ packet_t process(packet_t command) {
   }
 
   // Verify IDm matches - optimized order (nibble check first is faster)
-  if (UNLIKELY((command[2] & 0x0F) != (idm[0] & 0x0F)))
+  if ((command[2] & 0x0F) != (idm[0] & 0x0F))
     return nullptr;
-  if (UNLIKELY(memcmp(command + 3, idm + 1, 7) != 0))
+  if (memcmp(command + 3, idm + 1, 7) != 0)
     return nullptr;
 
   // Command code must be even
-  if (UNLIKELY(command_code & 0x01))
+  if (command_code & 0x01)
     return nullptr;
 
   // Set response code and copy IDm
@@ -465,21 +462,21 @@ packet_t process(packet_t command) {
   // Use computed goto or switch - switch is usually optimized well by compiler
   switch (command_code) {
   case CMD_REQUEST_SERVICE:
-    if (UNLIKELY(!request_service(command)))
+    if (!request_service(command))
       return nullptr;
     break;
 
   case CMD_REQUEST_RESPONSE:
-    if (UNLIKELY(len != 10))
+    if (len != 10)
       return nullptr;
     response[RESP_LEN] = RESP_PAYLOAD + 1;
     response[RESP_PAYLOAD] = 0x00; // Mode
     break;
 
   case CMD_READ_WO_ENC:
-    if (UNLIKELY(!read_without_encryption(command)))
+    if (!read_without_encryption(command))
       return nullptr;
-    if (UNLIKELY(response[RESP_PAYLOAD] != SF1_NORMAL_COMPLETION)) {
+    if (response[RESP_PAYLOAD] != SF1_NORMAL_COMPLETION) {
       save_error(command);
 #ifdef DEBUG
       Serial_println("Read failed");
@@ -489,12 +486,12 @@ packet_t process(packet_t command) {
     break;
 
   case CMD_WRITE_WO_ENC:
-    if (UNLIKELY(!write_without_encryption(command)))
+    if (!write_without_encryption(command))
       return nullptr;
     break;
 
   case CMD_SEARCH_SERVICE_CODE: {
-    if (UNLIKELY(len != 12))
+    if (len != 12)
       return nullptr;
     const int index = read_le16(command + 10);
     search_service_code(index);
@@ -502,9 +499,9 @@ packet_t process(packet_t command) {
   }
 
   case CMD_REQUEST_SYSTEM_CODE:
-    if (UNLIKELY(len != 10))
+    if (len != 10)
       return nullptr;
-    if (UNLIKELY(!request_system_code()))
+    if (!request_system_code())
       return nullptr;
     break;
 
@@ -526,7 +523,7 @@ static const char hex_table[] = "0123456789ABCDEF";
 
 void print_packet(packet_t packet) {
   int len = packet[0];
-  if (UNLIKELY(len == 0)) {
+  if (len == 0) {
     Serial_println("<empty>");
     return;
   }

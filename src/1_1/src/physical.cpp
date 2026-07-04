@@ -1,12 +1,10 @@
 // Physical and data link layer implementation for SiliCa
 // JIS X 6319-4 compatible card implementation
-// Optimized for speed
 //
 // Debug output is controlled by the DEBUG macro; see silica.h.
 
 #include "physical.h"
 #include "application.h"
-#include "compiler.h"
 #include <avr/interrupt.h>
 #include <avr/io.h>
 #include <stdint.h>
@@ -16,16 +14,15 @@
 // Constants
 // ============================================================================
 
-// Data link layer header size (preamble + sync code), in original bytes.
-// The header content itself is emitted inline by send_response().
+// Data link layer header: preamble (6x 0x00) + sync code (0xB2, 0x4D).
 static constexpr int HEADER_SIZE = 8;
+static constexpr uint8_t header[HEADER_SIZE] = {0x00, 0x00, 0x00, 0x00,
+                                                0x00, 0x00, 0xB2, 0x4D};
 
-// Manchester encoding lookup table
-// Stored in RAM for fast access (no pgm_read_byte overhead)
-// Aligned for faster memory access
-static const uint8_t manchester_table[16] __attribute__((aligned(16))) = {
-    0x55, 0x56, 0x59, 0x5A, 0x65, 0x66, 0x69, 0x6A,
-    0x95, 0x96, 0x99, 0x9A, 0xA5, 0xA6, 0xA9, 0xAA};
+// Manchester encoding lookup table (one nibble -> one encoded byte).
+static const uint8_t manchester_table[16] = {0x55, 0x56, 0x59, 0x5A, 0x65, 0x66,
+                                             0x69, 0x6A, 0x95, 0x96, 0x99, 0x9A,
+                                             0xA5, 0xA6, 0xA9, 0xAA};
 
 // ============================================================================
 // Buffer Size Configuration
@@ -42,11 +39,11 @@ static constexpr int CMD_BUF_SIZE = 260;
 // Buffers
 // ============================================================================
 
-// Buffer for receiving data - aligned for faster access
-static uint8_t rx_buf[RX_BUF_SIZE] __attribute__((aligned(4)));
+// Buffer for received (oversampled) frame data
+static uint8_t rx_buf[RX_BUF_SIZE];
 
-// Buffer for command processing - aligned for faster access
-static uint8_t command[CMD_BUF_SIZE] __attribute__((aligned(4)));
+// Buffer for the decoded command packet
+static uint8_t command[CMD_BUF_SIZE];
 
 // ============================================================================
 // Delayed Response for Polling Command
@@ -60,7 +57,7 @@ static volatile bool timer_expired = false;
 
 // Start delay timer using TCB0
 // Timer starts counting from capture_frame completion
-static FORCE_INLINE void start_delay_timer() {
+static void start_delay_timer() {
   // Reset state
   pending_response = nullptr;
   timer_expired = false;
@@ -71,7 +68,7 @@ static FORCE_INLINE void start_delay_timer() {
 }
 
 // Stop delay timer
-static FORCE_INLINE void stop_delay_timer() { TCB0.CTRLA = 0; }
+static void stop_delay_timer() { TCB0.CTRLA = 0; }
 
 // TCB0 interrupt handler for delayed response
 ISR(TCB0_INT_vect) {
@@ -99,7 +96,7 @@ ISR(TCB0_INT_vect) {
 
 #ifdef DEBUG
 // Serial write - blocking output
-FORCE_INLINE void Serial_write(uint8_t data) {
+void Serial_write(uint8_t data) {
   while (!(USART0.STATUS & USART_DREIF_bm)) {
     // do nothing
   }
@@ -120,7 +117,7 @@ void Serial_println(const char *str) {
 }
 #else
 // No-op versions for release build
-FORCE_INLINE void Serial_write(uint8_t) {}
+void Serial_write(uint8_t) {}
 void Serial_print(const char *) {}
 void Serial_println(const char *) {}
 #endif
@@ -129,11 +126,9 @@ void Serial_println(const char *) {}
 // SPI Functions
 // ============================================================================
 
-// Transfer one byte via SPI
-// Arduino SPI.transfer() equivalent
-// Inline for maximum speed
-static FORCE_INLINE uint8_t SPI_transfer(uint8_t data = 0) {
-  while (UNLIKELY(!(SPI0.INTFLAGS & SPI_DREIF_bm))) {
+// Transfer one byte via SPI (Arduino SPI.transfer() equivalent).
+static uint8_t SPI_transfer(uint8_t data = 0) {
+  while (!(SPI0.INTFLAGS & SPI_DREIF_bm)) {
     // do nothing
   }
   SPI0.DATA = data;
@@ -144,11 +139,10 @@ static FORCE_INLINE uint8_t SPI_transfer(uint8_t data = 0) {
 // CRC Functions
 // ============================================================================
 
-// Calculate CRC16-CCITT
-// Optimized with hints and restrict pointer
-static FORCE_INLINE uint16_t crc16(const uint8_t *RESTRICT buf, int len) {
+// Calculate CRC16-CCITT (XMODEM variant)
+static uint16_t crc16(const uint8_t *buf, int len) {
   uint16_t crc = 0;
-  const uint8_t *RESTRICT end = buf + len;
+  const uint8_t *end = buf + len;
   while (buf < end) {
     crc = _crc_xmodem_update(crc, *buf++);
   }
@@ -160,15 +154,12 @@ static FORCE_INLINE uint16_t crc16(const uint8_t *RESTRICT buf, int len) {
 // ============================================================================
 //
 // This is the RF-critical hot path: decoding runs against the Polling response
-// deadline (the TCB0 delay timer is armed right after capture_frame()). The
-// sync matcher (get_shift_from_sync_ex) and bit de-interleaver (extract_byte)
-// below are deliberately hand-unrolled/branch-based rather than table- or
-// loop-driven. Keep them that way unless a change is validated for timing on
-// real hardware (see check.py) - smaller code here can mean slower code.
+// deadline (the TCB0 delay timer is armed right after capture_frame()). If you
+// change get_shift_from_sync_ex or extract_byte, validate timing on real
+// hardware.
 
 // Capture frame from SPI
 // Return length of captured data
-// Optimized with hints
 static int capture_frame() {
   // Wait for start of frame
   for (int i = 0; i < RX_BUF_SIZE; i++) {
@@ -176,9 +167,9 @@ static int capture_frame() {
     rx_buf[i] = data;
 
     // End of frame - check for idle line
-    if (UNLIKELY(data == 0x00 || data == 0xFF)) {
+    if (data == 0x00 || data == 0xFF) {
       // Frame too short - restart
-      if (UNLIKELY(i < HEADER_SIZE * 2)) {
+      if (i < HEADER_SIZE * 2) {
         i = -1;
         continue;
       }
@@ -189,104 +180,47 @@ static int capture_frame() {
   return 0;
 }
 
-// Determine bit shift from sync pattern
-// Return -1 if not a valid sync pattern
-// Also checks inverted pattern and returns shift via pointer
-// Returns: 0 = normal, 1 = inverted, -1 = invalid
-// Fully unrolled for maximum speed - no loops, no table lookups
-static FORCE_INLINE int get_shift_from_sync_ex(uint8_t sync1, uint8_t sync2,
-                                               int &shift) {
-  // Pre-compute masks for both normal and inverted
-  const uint8_t a1 = sync1 & 0xAA;
-  const uint8_t b1 = sync1 & 0x55;
-  const uint8_t a2 = sync2 & 0xAA;
-  const uint8_t b2 = sync2 & 0x55;
+// Determine bit shift from a 2-byte sync pattern.
+// Returns 0 = normal, 1 = inverted, -1 = invalid; the matched shift (0..7) is
+// returned via the reference parameter.
+static int get_shift_from_sync_ex(uint8_t sync1, uint8_t sync2, int &shift) {
+  // One row per shift: {mask, expected sync1 & mask, expected sync2 & mask}.
+  // Even shifts occupy the odd bit lanes (0xAA), odd shifts the even (0x55).
+  static const uint8_t patterns[8][3] = {
+      {0xAA, 0x8A, 0x08}, {0x55, 0x45, 0x04}, {0xAA, 0x22, 0x82},
+      {0x55, 0x11, 0x41}, {0xAA, 0x08, 0xA0}, {0x55, 0x04, 0x50},
+      {0xAA, 0x02, 0x28}, {0x55, 0x01, 0x14},
+  };
 
-  // Check normal patterns (ordered by likely frequency - shift 0 first)
-  if (a1 == 0x8A && a2 == 0x08) {
-    shift = 0;
-    return 0;
+  // Check normal patterns first, then inverted.
+  for (int s = 0; s < 8; s++) {
+    const uint8_t mask = patterns[s][0];
+    if ((sync1 & mask) == patterns[s][1] && (sync2 & mask) == patterns[s][2]) {
+      shift = s;
+      return 0;
+    }
   }
-  if (b1 == 0x45 && b2 == 0x04) {
-    shift = 1;
-    return 0;
-  }
-  if (a1 == 0x22 && a2 == 0x82) {
-    shift = 2;
-    return 0;
-  }
-  if (b1 == 0x11 && b2 == 0x41) {
-    shift = 3;
-    return 0;
-  }
-  if (a1 == 0x08 && a2 == 0xA0) {
-    shift = 4;
-    return 0;
-  }
-  if (b1 == 0x04 && b2 == 0x50) {
-    shift = 5;
-    return 0;
-  }
-  if (a1 == 0x02 && a2 == 0x28) {
-    shift = 6;
-    return 0;
-  }
-  if (b1 == 0x01 && b2 == 0x14) {
-    shift = 7;
-    return 0;
-  }
-
-  // Check inverted patterns
-  const uint8_t inv_a1 = (~sync1) & 0xAA;
-  const uint8_t inv_b1 = (~sync1) & 0x55;
-  const uint8_t inv_a2 = (~sync2) & 0xAA;
-  const uint8_t inv_b2 = (~sync2) & 0x55;
-
-  if (inv_a1 == 0x8A && inv_a2 == 0x08) {
-    shift = 0;
-    return 1;
-  }
-  if (inv_b1 == 0x45 && inv_b2 == 0x04) {
-    shift = 1;
-    return 1;
-  }
-  if (inv_a1 == 0x22 && inv_a2 == 0x82) {
-    shift = 2;
-    return 1;
-  }
-  if (inv_b1 == 0x11 && inv_b2 == 0x41) {
-    shift = 3;
-    return 1;
-  }
-  if (inv_a1 == 0x08 && inv_a2 == 0xA0) {
-    shift = 4;
-    return 1;
-  }
-  if (inv_b1 == 0x04 && inv_b2 == 0x50) {
-    shift = 5;
-    return 1;
-  }
-  if (inv_a1 == 0x02 && inv_a2 == 0x28) {
-    shift = 6;
-    return 1;
-  }
-  if (inv_b1 == 0x01 && inv_b2 == 0x14) {
-    shift = 7;
-    return 1;
+  const uint8_t inv1 = ~sync1;
+  const uint8_t inv2 = ~sync2;
+  for (int s = 0; s < 8; s++) {
+    const uint8_t mask = patterns[s][0];
+    if ((inv1 & mask) == patterns[s][1] && (inv2 & mask) == patterns[s][2]) {
+      shift = s;
+      return 1;
+    }
   }
 
   shift = -1;
   return -1; // invalid
 }
 
-// Find sync pattern in received data
-// Return index of first sync byte
-// Optimized: single function call checks both normal and inverted patterns
-static FORCE_INLINE int find_sync_index(int rx_len, int &shift, bool &invert) {
+// Find sync pattern in received data.
+// Returns index of first sync byte, or -1 if not found.
+static int find_sync_index(int rx_len, int &shift, bool &invert) {
   const int limit = rx_len - 1;
   for (int i = 0; i < limit; i++) {
     const int result = get_shift_from_sync_ex(rx_buf[i], rx_buf[i + 1], shift);
-    if (LIKELY(result >= 0)) {
+    if (result >= 0) {
       invert = (result == 1);
       return i;
     }
@@ -294,57 +228,19 @@ static FORCE_INLINE int find_sync_index(int rx_len, int &shift, bool &invert) {
   return -1;
 }
 
-// Extract one byte from 3 bytes of received data
-// according to the specified bit shift
-// Optimized using bitwise operations - fully inlined for speed
-static FORCE_INLINE uint8_t extract_byte(int shift, uint8_t d0, uint8_t d1,
-                                         uint8_t d2) {
-  // Use switch for compile-time optimization
-  // The compiler will generate efficient code for this pattern
-  switch (shift) {
-  case 0:
-    // d0[7,5,3,1] -> r[7,6,5,4], d1[7,5,3,1] -> r[3,2,1,0]
-    return ((d0 & 0x80) ? 0x80 : 0) | ((d0 & 0x20) ? 0x40 : 0) |
-           ((d0 & 0x08) ? 0x20 : 0) | ((d0 & 0x02) ? 0x10 : 0) |
-           ((d1 & 0x80) ? 0x08 : 0) | ((d1 & 0x20) ? 0x04 : 0) |
-           ((d1 & 0x08) ? 0x02 : 0) | ((d1 & 0x02) ? 0x01 : 0);
-  case 1:
-    return ((d0 & 0x40) ? 0x80 : 0) | ((d0 & 0x10) ? 0x40 : 0) |
-           ((d0 & 0x04) ? 0x20 : 0) | ((d0 & 0x01) ? 0x10 : 0) |
-           ((d1 & 0x40) ? 0x08 : 0) | ((d1 & 0x10) ? 0x04 : 0) |
-           ((d1 & 0x04) ? 0x02 : 0) | ((d1 & 0x01) ? 0x01 : 0);
-  case 2:
-    return ((d0 & 0x20) ? 0x80 : 0) | ((d0 & 0x08) ? 0x40 : 0) |
-           ((d0 & 0x02) ? 0x20 : 0) | ((d1 & 0x80) ? 0x10 : 0) |
-           ((d1 & 0x20) ? 0x08 : 0) | ((d1 & 0x08) ? 0x04 : 0) |
-           ((d1 & 0x02) ? 0x02 : 0) | ((d2 & 0x80) ? 0x01 : 0);
-  case 3:
-    return ((d0 & 0x10) ? 0x80 : 0) | ((d0 & 0x04) ? 0x40 : 0) |
-           ((d0 & 0x01) ? 0x20 : 0) | ((d1 & 0x40) ? 0x10 : 0) |
-           ((d1 & 0x10) ? 0x08 : 0) | ((d1 & 0x04) ? 0x04 : 0) |
-           ((d1 & 0x01) ? 0x02 : 0) | ((d2 & 0x40) ? 0x01 : 0);
-  case 4:
-    return ((d0 & 0x08) ? 0x80 : 0) | ((d0 & 0x02) ? 0x40 : 0) |
-           ((d1 & 0x80) ? 0x20 : 0) | ((d1 & 0x20) ? 0x10 : 0) |
-           ((d1 & 0x08) ? 0x08 : 0) | ((d1 & 0x02) ? 0x04 : 0) |
-           ((d2 & 0x80) ? 0x02 : 0) | ((d2 & 0x20) ? 0x01 : 0);
-  case 5:
-    return ((d0 & 0x04) ? 0x80 : 0) | ((d0 & 0x01) ? 0x40 : 0) |
-           ((d1 & 0x40) ? 0x20 : 0) | ((d1 & 0x10) ? 0x10 : 0) |
-           ((d1 & 0x04) ? 0x08 : 0) | ((d1 & 0x01) ? 0x04 : 0) |
-           ((d2 & 0x40) ? 0x02 : 0) | ((d2 & 0x10) ? 0x01 : 0);
-  case 6:
-    return ((d0 & 0x02) ? 0x80 : 0) | ((d1 & 0x80) ? 0x40 : 0) |
-           ((d1 & 0x20) ? 0x20 : 0) | ((d1 & 0x08) ? 0x10 : 0) |
-           ((d1 & 0x02) ? 0x08 : 0) | ((d2 & 0x80) ? 0x04 : 0) |
-           ((d2 & 0x20) ? 0x02 : 0) | ((d2 & 0x08) ? 0x01 : 0);
-  case 7:
-  default:
-    return ((d0 & 0x01) ? 0x80 : 0) | ((d1 & 0x40) ? 0x40 : 0) |
-           ((d1 & 0x10) ? 0x20 : 0) | ((d1 & 0x04) ? 0x10 : 0) |
-           ((d1 & 0x01) ? 0x08 : 0) | ((d2 & 0x40) ? 0x04 : 0) |
-           ((d2 & 0x10) ? 0x02 : 0) | ((d2 & 0x04) ? 0x01 : 0);
+// Extract one data byte from 3 oversampled bytes at the given bit shift.
+// The bit for output position k (MSB first) sits at bit (23 - shift - 2k) of
+// the 24-bit window {d0, d1, d2}; align it to the top, then step 2 bits.
+static uint8_t extract_byte(int shift, uint8_t d0, uint8_t d1, uint8_t d2) {
+  uint32_t window = ((uint32_t)d0 << 16) | ((uint32_t)d1 << 8) | d2;
+  window <<= shift;
+
+  uint8_t result = 0;
+  for (int k = 0; k < 8; k++) {
+    result = (result << 1) | ((window >> 23) & 1);
+    window <<= 2;
   }
+  return result;
 }
 
 // Receive command packet from the reader
@@ -359,7 +255,7 @@ packet_t receive_command() {
   // Will be stopped later if not a Polling command or if error occurs
   start_delay_timer();
 
-  if (UNLIKELY(rx_len == 0)) {
+  if (rx_len == 0) {
     return nullptr;
   }
 
@@ -367,36 +263,25 @@ packet_t receive_command() {
   int shift = -1;
   bool invert;
   int rx_index = find_sync_index(rx_len, shift, invert);
-  if (UNLIKELY(rx_index == -1)) {
+  if (rx_index == -1) {
     return nullptr;
   }
 
   // Skip sync pattern (4 bytes in oversampled data = 2 bytes original)
   rx_index += 4;
 
-  // Decode data - optimized with hints and pointer arithmetic
-  int index = 0;
+  // Decode data (the inverted path just XORs each byte with 0xFF)
+  const uint8_t xor_mask = invert ? 0xFF : 0x00;
   const int end_index = rx_len - 2;
-  const uint8_t *RESTRICT src = rx_buf + rx_index;
-  uint8_t *RESTRICT dst = command;
-
-  if (invert) {
-    // Inverted path - XOR with 0xFF
-    for (int i = rx_index; i < end_index; i += 2, src += 2) {
-      *dst++ = ~extract_byte(shift, src[0], src[1], src[2]);
-      index++;
-    }
-  } else {
-    // Normal path - no XOR needed
-    for (int i = rx_index; i < end_index; i += 2, src += 2) {
-      *dst++ = extract_byte(shift, src[0], src[1], src[2]);
-      index++;
-    }
+  int index = 0;
+  for (int i = rx_index; i < end_index; i += 2) {
+    const uint8_t *src = rx_buf + i;
+    command[index++] = extract_byte(shift, src[0], src[1], src[2]) ^ xor_mask;
   }
 
   // Verify length
   const int len = command[0];
-  if (UNLIKELY(len + 2 > index)) {
+  if (len + 2 > index) {
     return nullptr;
   }
 
@@ -406,7 +291,7 @@ packet_t receive_command() {
       (static_cast<uint16_t>(command[len]) << 8) | command[len + 1];
 
   // Allow last 1-bit error
-  if (UNLIKELY((calculated_edc ^ received_edc) > 1)) {
+  if ((calculated_edc ^ received_edc) > 1) {
     return nullptr;
   }
 
@@ -418,8 +303,7 @@ packet_t receive_command() {
 // ============================================================================
 
 // Enable or disable transmission
-// Inline for maximum speed
-static FORCE_INLINE void enable_transmit(bool enable) {
+static void enable_transmit(bool enable) {
   // Flush buffer
   SPI_transfer(0x00);
   SPI_transfer(0x00);
@@ -431,8 +315,7 @@ static FORCE_INLINE void enable_transmit(bool enable) {
 }
 
 // Transmit one byte with Manchester encoding
-// Inline for maximum speed - uses direct table indexing
-static FORCE_INLINE void transmit_byte(uint8_t data) {
+static void transmit_byte(uint8_t data) {
   SPI_transfer(manchester_table[data >> 4]);
   SPI_transfer(manchester_table[data & 0x0F]);
 }
@@ -440,7 +323,7 @@ static FORCE_INLINE void transmit_byte(uint8_t data) {
 // Send response packet to the reader
 // Null response means no response
 void send_response(packet_t response) {
-  if (UNLIKELY(response == nullptr))
+  if (response == nullptr)
     return;
 
   const int len = response[0];
@@ -450,29 +333,15 @@ void send_response(packet_t response) {
 
   enable_transmit(true);
 
-  // Send header (fully unrolled for maximum speed)
-  // header[0-5] are all 0x00, header[6]=0xB2, header[7]=0x4D
-  // Manchester encoded: 0x00 -> 0x55,0x55
-  SPI_transfer(0x55);
-  SPI_transfer(0x55); // header[0] = 0x00
-  SPI_transfer(0x55);
-  SPI_transfer(0x55); // header[1] = 0x00
-  SPI_transfer(0x55);
-  SPI_transfer(0x55); // header[2] = 0x00
-  SPI_transfer(0x55);
-  SPI_transfer(0x55); // header[3] = 0x00
-  SPI_transfer(0x55);
-  SPI_transfer(0x55); // header[4] = 0x00
-  SPI_transfer(0x55);
-  SPI_transfer(0x55);  // header[5] = 0x00
-  transmit_byte(0xB2); // header[6] = 0xB2
-  transmit_byte(0x4D); // header[7] = 0x4D
+  // Send header. Transmission is SPI-clock-bound, so a loop is as fast as
+  // unrolling (the SPI busy-wait dwarfs any loop overhead).
+  for (int i = 0; i < HEADER_SIZE; i++) {
+    transmit_byte(header[i]);
+  }
 
-  // Send body - use pointer for faster iteration
-  const uint8_t *RESTRICT ptr = response;
-  const uint8_t *RESTRICT end = response + len;
-  while (ptr < end) {
-    transmit_byte(*ptr++);
+  // Send body (the length byte is included in len)
+  for (int i = 0; i < len; i++) {
+    transmit_byte(response[i]);
   }
 
   // Send footer (EDC)
@@ -594,7 +463,7 @@ static void send_delayed_response(packet_t response) {
 void loop() {
   // Timer is started in receive_command after capture_frame completes
   packet_t cmd = receive_command();
-  if (UNLIKELY(cmd == nullptr))
+  if (cmd == nullptr)
     return;
 
   // Check if this is a Polling command
@@ -602,20 +471,20 @@ void loop() {
   // - Keep it running for Polling command (cmd[1] == 0x00)
   // - Stop it for other commands
   const bool is_polling = (cmd[1] == 0x00);
-  if (LIKELY(!is_polling)) {
+  if (!is_polling) {
     // Stop timer for non-Polling commands (most common case)
     stop_delay_timer();
   }
 
   packet_t resp = process(cmd);
-  if (UNLIKELY(resp == nullptr)) {
+  if (resp == nullptr) {
     save_error(cmd);
     // Stop timer if still running
     stop_delay_timer();
     return;
   }
 
-  if (UNLIKELY(is_polling)) {
+  if (is_polling) {
     // Use timer for delayed response (2.417ms from capture_frame completion)
     send_delayed_response(resp);
   } else {
